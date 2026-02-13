@@ -1,0 +1,590 @@
+---
+# ============================================================================
+# SLURM Cluster Monitoring Setup - Complete Installation
+# ============================================================================
+# This playbook installs:
+# 1. Node Exporter on controller and compute nodes ONLY (login excluded)
+# 2. Prometheus on controller node
+# 3. Grafana on controller node
+# 4. Configures everything automatically
+# ============================================================================
+
+- name: Step 1 - Install Node Exporter on Controller and Compute Nodes
+  hosts: slurm_controller,slurm_compute
+  become: yes
+  vars:
+    node_exporter_version: "1.7.0"
+  
+  tasks:
+    - name: Print starting message
+      debug:
+        msg: "Installing Node Exporter on {{ inventory_hostname }}..."
+      run_once: no
+
+    - name: Create node_exporter user
+      user:
+        name: node_exporter
+        shell: /bin/false
+        system: yes
+        create_home: no
+
+    - name: Download Node Exporter
+      get_url:
+        url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+        dest: /tmp/node_exporter.tar.gz
+        timeout: 120
+
+    - name: Extract Node Exporter
+      unarchive:
+        src: /tmp/node_exporter.tar.gz
+        dest: /tmp/
+        remote_src: yes
+
+    - name: Copy Node Exporter binary
+      copy:
+        src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+        dest: /usr/local/bin/node_exporter
+        owner: node_exporter
+        group: node_exporter
+        mode: '0755'
+        remote_src: yes
+
+    - name: Create Node Exporter systemd service
+      copy:
+        dest: /etc/systemd/system/node_exporter.service
+        content: |
+          [Unit]
+          Description=Node Exporter
+          After=network.target
+
+          [Service]
+          User=node_exporter
+          Group=node_exporter
+          Type=simple
+          ExecStart=/usr/local/bin/node_exporter \
+            --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/) \
+            --collector.netclass.ignored-devices=^(veth.*|docker.*|br-.*|lo)$$
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Start and enable Node Exporter
+      systemd:
+        name: node_exporter
+        state: started
+        enabled: yes
+
+    - name: Wait for Node Exporter to be ready
+      wait_for:
+        port: 9100
+        delay: 3
+        timeout: 30
+
+    - name: Verify Node Exporter is running
+      uri:
+        url: "http://localhost:9100/metrics"
+        return_content: yes
+      register: metrics
+      failed_when: "'node_cpu_seconds_total' not in metrics.content"
+
+    - name: Show success message
+      debug:
+        msg: "✓ Node Exporter running on {{ inventory_hostname }}:9100"
+
+
+- name: Step 2 - Install Prometheus on Controller
+  hosts: slurm_controller
+  become: yes
+  vars:
+    prometheus_version: "2.48.1"
+  
+  tasks:
+    - name: Print starting message
+      debug:
+        msg: "Installing Prometheus on controller..."
+
+    - name: Create prometheus user
+      user:
+        name: prometheus
+        shell: /bin/false
+        system: yes
+        create_home: no
+
+    - name: Create Prometheus directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: prometheus
+        group: prometheus
+        mode: '0755'
+      loop:
+        - /etc/prometheus
+        - /var/lib/prometheus
+
+    - name: Download Prometheus
+      get_url:
+        url: "https://github.com/prometheus/prometheus/releases/download/v{{ prometheus_version }}/prometheus-{{ prometheus_version }}.linux-amd64.tar.gz"
+        dest: /tmp/prometheus.tar.gz
+        timeout: 120
+
+    - name: Extract Prometheus
+      unarchive:
+        src: /tmp/prometheus.tar.gz
+        dest: /tmp/
+        remote_src: yes
+
+    - name: Copy Prometheus binaries
+      copy:
+        src: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        owner: prometheus
+        group: prometheus
+        mode: '0755'
+        remote_src: yes
+      loop:
+        - prometheus
+        - promtool
+
+    - name: Copy console files
+      copy:
+        src: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/{{ item }}"
+        dest: "/etc/prometheus/{{ item }}"
+        owner: prometheus
+        group: prometheus
+        remote_src: yes
+      loop:
+        - consoles
+        - console_libraries
+
+    - name: Get cluster node information
+      set_fact:
+        controller_ip: "{{ hostvars['controller']['ansible_host'] }}"
+        compute_nodes: "{{ groups['slurm_compute'] | map('extract', hostvars) | list }}"
+
+    - name: Create Prometheus configuration (cluster nodes only)
+      copy:
+        dest: /etc/prometheus/prometheus.yml
+        owner: prometheus
+        group: prometheus
+        mode: '0644'
+        content: |
+          global:
+            scrape_interval: 15s
+            evaluation_interval: 15s
+            external_labels:
+              cluster: 'slurm-hpc'
+              environment: 'production'
+
+          scrape_configs:
+            # Controller Node (this machine)
+            - job_name: 'controller-node'
+              static_configs:
+                - targets: ['localhost:9100']
+                  labels:
+                    node_type: 'controller'
+                    hostname: 'controller'
+                    role: 'controller'
+
+            # Compute Nodes
+            - job_name: 'compute-nodes'
+              static_configs:
+                - targets:
+          {% for node in compute_nodes %}
+                    - '{{ node.ansible_host }}:9100'
+          {% endfor %}
+                  labels:
+                    node_type: 'compute'
+                    role: 'compute'
+
+            # Prometheus self-monitoring
+            - job_name: 'prometheus'
+              static_configs:
+                - targets: ['localhost:9090']
+                  labels:
+                    role: 'monitoring'
+
+    - name: Validate Prometheus configuration
+      command: /usr/local/bin/promtool check config /etc/prometheus/prometheus.yml
+      register: config_check
+
+    - name: Show config validation
+      debug:
+        msg: "{{ config_check.stdout_lines }}"
+
+    - name: Create Prometheus systemd service
+      copy:
+        dest: /etc/systemd/system/prometheus.service
+        content: |
+          [Unit]
+          Description=Prometheus Time Series Database
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          User=prometheus
+          Group=prometheus
+          Type=simple
+          Restart=on-failure
+          ExecStart=/usr/local/bin/prometheus \
+            --config.file=/etc/prometheus/prometheus.yml \
+            --storage.tsdb.path=/var/lib/prometheus/ \
+            --web.console.templates=/etc/prometheus/consoles \
+            --web.console.libraries=/etc/prometheus/console_libraries \
+            --web.listen-address=0.0.0.0:9090 \
+            --storage.tsdb.retention.time=30d \
+            --storage.tsdb.retention.size=10GB
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Start and enable Prometheus
+      systemd:
+        name: prometheus
+        state: restarted
+        enabled: yes
+
+    - name: Wait for Prometheus to be ready
+      wait_for:
+        port: 9090
+        delay: 5
+        timeout: 60
+
+    - name: Check Prometheus health
+      uri:
+        url: "http://localhost:9090/-/healthy"
+        return_content: yes
+      register: prom_health
+
+    - name: Wait for targets to be scraped
+      pause:
+        seconds: 20
+        prompt: "Waiting for Prometheus to scrape all targets..."
+
+    - name: Get Prometheus targets status
+      uri:
+        url: "http://localhost:9090/api/v1/targets"
+        return_content: yes
+      register: targets
+
+    - name: Count active targets
+      set_fact:
+        total_targets: "{{ targets.json.data.activeTargets | length }}"
+        up_targets: "{{ targets.json.data.activeTargets | selectattr('health', 'equalto', 'up') | list | length }}"
+
+    - name: Show Prometheus status
+      debug:
+        msg:
+          - "✓ Prometheus is running on controller:9090"
+          - "✓ Total targets: {{ total_targets }}"
+          - "✓ Healthy targets: {{ up_targets }}"
+          - "✓ Data retention: 30 days / 10GB"
+          - "✓ Monitoring: Controller + Compute nodes only"
+
+
+- name: Step 3 - Install Grafana on Controller
+  hosts: slurm_controller
+  become: yes
+  
+  tasks:
+    - name: Print starting message
+      debug:
+        msg: "Installing Grafana on controller..."
+
+    - name: Install dependencies
+      apt:
+        name:
+          - apt-transport-https
+          - software-properties-common
+          - wget
+        state: present
+        update_cache: yes
+
+    - name: Add Grafana GPG key
+      apt_key:
+        url: https://apt.grafana.com/gpg.key
+        state: present
+
+    - name: Add Grafana repository
+      apt_repository:
+        repo: "deb https://apt.grafana.com stable main"
+        state: present
+        filename: grafana
+
+    - name: Install Grafana
+      apt:
+        name: grafana
+        state: present
+        update_cache: yes
+
+    - name: Configure Grafana to bind to all interfaces
+      lineinfile:
+        path: /etc/grafana/grafana.ini
+        regexp: '^;?http_addr ='
+        line: 'http_addr = 0.0.0.0'
+        state: present
+
+    - name: Configure Grafana admin password
+      lineinfile:
+        path: /etc/grafana/grafana.ini
+        regexp: '^;?admin_password ='
+        line: 'admin_password = admin'
+        state: present
+
+    - name: Start and enable Grafana
+      systemd:
+        name: grafana-server
+        state: restarted
+        enabled: yes
+
+    - name: Wait for Grafana to be ready
+      wait_for:
+        port: 3000
+        delay: 10
+        timeout: 60
+
+    - name: Wait for Grafana API to be available
+      pause:
+        seconds: 15
+        prompt: "Waiting for Grafana to fully start..."
+
+    - name: Check Grafana health
+      uri:
+        url: "http://localhost:3000/api/health"
+        return_content: yes
+      register: grafana_health
+
+    - name: Add Prometheus data source to Grafana
+      uri:
+        url: "http://localhost:3000/api/datasources"
+        method: POST
+        user: admin
+        password: admin
+        force_basic_auth: yes
+        body_format: json
+        body:
+          name: "Prometheus"
+          type: "prometheus"
+          url: "http://localhost:9090"
+          access: "proxy"
+          isDefault: true
+          jsonData:
+            timeInterval: "15s"
+        status_code: [200, 409]
+      register: datasource_result
+
+    - name: Show Grafana status
+      debug:
+        msg:
+          - "✓ Grafana is running on controller:3000"
+          - "✓ Default credentials: admin/admin"
+          - "✓ Prometheus datasource configured"
+          - ""
+          - "NOTE: Dashboard import must be done manually in browser"
+          - "Dashboard ID to import: 1860 (Node Exporter Full)"
+
+
+- name: Step 4 - Verify Complete Monitoring Stack
+  hosts: slurm_controller
+  become: yes
+  
+  tasks:
+    - name: Print verification header
+      debug:
+        msg:
+          - ""
+          - "=========================================="
+          - "VERIFYING MONITORING STACK"
+          - "=========================================="
+
+    - name: Get final Prometheus targets
+      uri:
+        url: "http://localhost:9090/api/v1/targets"
+        return_content: yes
+      register: final_targets
+
+    - name: Parse target status
+      set_fact:
+        all_targets: "{{ final_targets.json.data.activeTargets }}"
+        up_count: "{{ final_targets.json.data.activeTargets | selectattr('health', 'equalto', 'up') | list | length }}"
+        down_count: "{{ final_targets.json.data.activeTargets | selectattr('health', 'equalto', 'down') | list | length }}"
+
+    - name: Show detailed target status
+      debug:
+        msg: "{{ item.labels.job }} - {{ item.labels.hostname | default(item.scrapeUrl) }} - {{ item.health | upper }}"
+      loop: "{{ all_targets }}"
+      loop_control:
+        label: "{{ item.labels.job }}"
+
+    - name: Test Prometheus query
+      uri:
+        url: "http://localhost:9090/api/v1/query?query=up"
+        return_content: yes
+      register: query_test
+
+    - name: Get Grafana datasource status
+      uri:
+        url: "http://localhost:3000/api/datasources"
+        method: GET
+        user: admin
+        password: admin
+        force_basic_auth: yes
+        return_content: yes
+      register: datasources
+
+    - name: Final summary
+      debug:
+        msg:
+          - ""
+          - "=========================================="
+          - "✓✓✓ MONITORING STACK DEPLOYED ✓✓✓"
+          - "=========================================="
+          - ""
+          - "PROMETHEUS STATUS:"
+          - "  URL: http://{{ ansible_host }}:9090"
+          - "  Targets UP: {{ up_count }}"
+          - "  Targets DOWN: {{ down_count }}"
+          - "  Total Targets: {{ all_targets | length }}"
+          - ""
+          - "GRAFANA STATUS:"
+          - "  URL: http://{{ ansible_host }}:3000"
+          - "  Username: admin"
+          - "  Password: admin"
+          - "  Datasources: {{ datasources.json | length }}"
+          - ""
+          - "NODE EXPORTER:"
+          - "  Controller: {{ ansible_host }}:9100"
+          - "  Compute Nodes: {{ groups['slurm_compute'] | length }} nodes on port 9100"
+          - ""
+          - "NOTE: Login node is NOT monitored (excluded by design)"
+          - ""
+          - "=========================================="
+          - "ACCESS INSTRUCTIONS"
+          - "=========================================="
+          - ""
+          - "From your laptop, create SSH tunnel:"
+          - "  ssh -i {{ ansible_ssh_private_key_file }} \\"
+          - "      -L 3000:{{ ansible_host }}:3000 \\"
+          - "      -L 9090:{{ ansible_host }}:9090 \\"
+          - "      ubuntu@{{ hostvars['login']['ansible_host'] }}"
+          - ""
+          - "Then open in browser:"
+          - "  Grafana:    http://localhost:3000"
+          - "  Prometheus: http://localhost:9090"
+          - ""
+          - "First time Grafana login:"
+          - "  1. Go to http://localhost:3000"
+          - "  2. Login: admin/admin"
+          - "  3. Change password when prompted"
+          - "  4. Go to Dashboards → Import"
+          - "  5. Enter dashboard ID: 1860"
+          - "  6. Select Prometheus datasource"
+          - "  7. Click Import"
+          - ""
+          - "Recommended Dashboards to Import:"
+          - "  - Node Exporter Full (ID: 1860)"
+          - "  - Node Exporter Simple (ID: 405)"
+          - "  - System Overview (ID: 11074)"
+          - ""
+          - "=========================================="
+
+    - name: Save monitoring info to file
+      copy:
+        dest: /tmp/monitoring_info.txt
+        content: |
+          SLURM Cluster Monitoring Information
+          =====================================
+          Deployment Date: {{ ansible_date_time.iso8601 }}
+
+          PROMETHEUS
+          ----------
+          URL: http://{{ ansible_host }}:9090
+          Targets: {{ up_count }} UP / {{ down_count }} DOWN
+          Retention: 30 days / 10GB
+          Config: /etc/prometheus/prometheus.yml
+
+          GRAFANA
+          -------
+          URL: http://{{ ansible_host }}:3000
+          Username: admin
+          Password: admin
+          Config: /etc/grafana/grafana.ini
+
+          NODE EXPORTER
+          -------------
+          Controller: {{ ansible_host }}:9100
+          Compute Nodes:
+          {% for node in groups['slurm_compute'] %}
+            {{ hostvars[node].inventory_hostname }}: {{ hostvars[node].ansible_host }}:9100
+          {% endfor %}
+
+          NOTE: Login node is NOT monitored (excluded by design)
+
+          SSH TUNNEL COMMAND
+          ------------------
+          ssh -i {{ ansible_ssh_private_key_file }} \
+              -L 3000:{{ ansible_host }}:3000 \
+              -L 9090:{{ ansible_host }}:9090 \
+              ubuntu@{{ hostvars['login']['ansible_host'] }}
+
+          BROWSER ACCESS
+          --------------
+          Grafana:    http://localhost:3000
+          Prometheus: http://localhost:9090
+
+          GRAFANA DASHBOARDS TO IMPORT
+          -----------------------------
+          1. Node Exporter Full (ID: 1860)
+             - Comprehensive system metrics
+             - CPU, Memory, Disk, Network
+             - Per-node breakdown
+
+          2. Node Exporter Simple (ID: 405)
+             - Clean, minimal layout
+             - Key metrics only
+
+          3. System Overview (ID: 11074)
+             - Multi-node overview
+             - Cluster-wide stats
+
+          TROUBLESHOOTING
+          ---------------
+          Check Node Exporter:
+            curl http://localhost:9100/metrics
+
+          Check Prometheus targets:
+            http://localhost:9090/targets
+
+          Check Prometheus logs:
+            sudo journalctl -u prometheus -f
+
+          Check Grafana logs:
+            sudo journalctl -u grafana-server -f
+
+          Restart services:
+            sudo systemctl restart node_exporter
+            sudo systemctl restart prometheus
+            sudo systemctl restart grafana-server
+
+    - name: Fetch monitoring info to local machine
+      fetch:
+        src: /tmp/monitoring_info.txt
+        dest: ./monitoring_info.txt
+        flat: yes
+
+    - name: Final reminder
+      debug:
+        msg:
+          - ""
+          - "✓ Monitoring info saved to: ./monitoring_info.txt"
+          - "✓ All cluster services are running and healthy"
+          - "✓ Ready to access dashboards!"
+          - "✓ Monitoring: Controller + {{ groups['slurm_compute'] | length }} Compute nodes"
+          - ""

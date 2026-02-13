@@ -1,0 +1,73 @@
+SLURM Cluster Monitoring Information
+=====================================
+Deployment Date: 2026-01-27T15:51:54Z
+
+PROMETHEUS
+----------
+URL: http://10.0.2.62:9090
+Targets: 5 UP / 0 DOWN
+Retention: 30 days / 10GB
+Config: /etc/prometheus/prometheus.yml
+
+GRAFANA
+-------
+URL: http://10.0.2.62:3000
+Username: admin
+Password: admin
+Config: /etc/grafana/grafana.ini
+
+NODE EXPORTER
+-------------
+Controller: 10.0.2.62:9100
+Compute Nodes:
+  compute1: 10.0.2.101:9100
+  compute2: 10.0.2.11:9100
+  compute3: 10.0.2.54:9100
+
+NOTE: Login node is NOT monitored (excluded by design)
+
+SSH TUNNEL COMMAND
+------------------
+ssh -i /root/.ssh/mykey.pem \
+    -L 3000:10.0.2.62:3000 \
+    -L 9090:10.0.2.62:9090 \
+    ubuntu@13.234.114.212
+
+BROWSER ACCESS
+--------------
+Grafana:    http://localhost:3000
+Prometheus: http://localhost:9090
+
+GRAFANA DASHBOARDS TO IMPORT
+-----------------------------
+1. Node Exporter Full (ID: 1860)
+   - Comprehensive system metrics
+   - CPU, Memory, Disk, Network
+   - Per-node breakdown
+
+2. Node Exporter Simple (ID: 405)
+   - Clean, minimal layout
+   - Key metrics only
+
+3. System Overview (ID: 11074)
+   - Multi-node overview
+   - Cluster-wide stats
+
+TROUBLESHOOTING
+---------------
+Check Node Exporter:
+  curl http://localhost:9100/metrics
+
+Check Prometheus targets:
+  http://localhost:9090/targets
+
+Check Prometheus logs:
+  sudo journalctl -u prometheus -f
+
+Check Grafana logs:
+  sudo journalctl -u grafana-server -f
+
+Restart services:
+  sudo systemctl restart node_exporter
+  sudo systemctl restart prometheus
+  sudo systemctl restart grafana-server
