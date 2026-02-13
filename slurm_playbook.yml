@@ -1,0 +1,465 @@
+---
+# Download Slurm packages on localhost first
+- name: Download Slurm Source on Local Machine
+  hosts: localhost
+  connection: local
+  become: yes
+  vars_files:
+    - group_vars/all.yml
+  tasks:
+    - name: Create download directory
+      file:
+        path: /tmp/slurm-packages
+        state: directory
+
+    - name: Download Slurm source
+      get_url:
+        url: "{{ slurm_url }}"
+        dest: "/tmp/slurm-packages/slurm-{{ slurm_version }}.tar.bz2"
+        timeout: 300
+
+# Transfer to all nodes
+- name: Transfer Slurm Source to All Nodes
+  hosts: slurm_controller,slurm_compute,slurm_login
+  become: yes
+  vars_files:
+    - group_vars/all.yml
+  tasks:
+    - name: Create remote package directory
+      file:
+        path: /tmp/slurm-packages
+        state: directory
+
+    - name: Copy Slurm source to nodes
+      copy:
+        src: "/tmp/slurm-packages/slurm-{{ slurm_version }}.tar.bz2"
+        dest: "/tmp/slurm-packages/"
+
+# Install dependencies on all nodes
+- name: Install Dependencies on All Nodes
+  hosts: slurm_controller,slurm_compute,slurm_login
+  become: yes
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install build dependencies
+      apt:
+        name:
+          - build-essential
+          - gcc
+          - g++
+          - make
+          - munge
+          - libmunge-dev
+          - libmunge2
+          - mariadb-server
+          - libmariadb-dev
+          - libmariadb-dev-compat
+          - python3-pymysql
+          - libssl-dev
+          - libjson-c-dev
+          - libhttp-parser-dev
+          - libyaml-dev
+          - libdbus-1-dev
+          - liblz4-dev
+        state: present
+
+    - name: Start and enable munge
+      systemd:
+        name: munge
+        state: started
+        enabled: yes
+
+# Setup munge authentication
+- name: Setup Munge Authentication
+  hosts: slurm_controller
+  become: yes
+  tasks:
+    - name: Check if munge key exists
+      stat:
+        path: /etc/munge/munge.key
+      register: munge_key
+
+    - name: Generate munge key
+      command: create-munge-key -f
+      when: not munge_key.stat.exists
+
+    - name: Set munge key permissions
+      file:
+        path: /etc/munge/munge.key
+        owner: munge
+        group: munge
+        mode: '0400'
+
+    - name: Restart munge on controller
+      systemd:
+        name: munge
+        state: restarted
+
+    - name: Fetch munge key
+      fetch:
+        src: /etc/munge/munge.key
+        dest: /tmp/munge.key
+        flat: yes
+
+# Distribute munge key
+- name: Distribute Munge Key to Compute and Login Nodes
+  hosts: slurm_compute,slurm_login
+  become: yes
+  tasks:
+    - name: Copy munge key
+      copy:
+        src: /tmp/munge.key
+        dest: /etc/munge/munge.key
+        owner: munge
+        group: munge
+        mode: '0400'
+
+    - name: Restart munge
+      systemd:
+        name: munge
+        state: restarted
+
+# Build and install Slurm on all nodes
+- name: Build and Install Slurm on All Nodes
+  hosts: slurm_controller,slurm_compute,slurm_login
+  become: yes
+  vars_files:
+    - group_vars/all.yml
+  tasks:
+    - name: Extract Slurm source
+      unarchive:
+        src: "/tmp/slurm-packages/slurm-{{ slurm_version }}.tar.bz2"
+        dest: /root/
+        remote_src: yes
+        creates: "{{ slurm_install_dir }}"
+
+    - name: Configure Slurm
+      command: ./configure --prefix=/usr --sysconfdir=/etc/slurm --with-mysql_config=/usr/bin/mariadb_config
+      args:
+        chdir: "{{ slurm_install_dir }}"
+        creates: "{{ slurm_install_dir }}/config.log"
+
+    - name: Build Slurm
+      make:
+        chdir: "{{ slurm_install_dir }}"
+        target: all
+        params:
+          NUM_THREADS: 2
+
+    - name: Install Slurm
+      make:
+        chdir: "{{ slurm_install_dir }}"
+        target: install
+
+    - name: Create Slurm directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - /etc/slurm
+        - /var/spool/slurm
+        - /var/spool/slurm/d
+        - /var/spool/slurmctld
+        - /var/log/slurm
+
+    - name: Add Slurm to PATH for ubuntu user
+      lineinfile:
+        path: /home/ubuntu/.bashrc
+        line: 'export PATH=$PATH:/usr/bin:/usr/sbin'
+        create: yes
+
+    - name: Add Slurm to PATH for root
+      lineinfile:
+        path: /root/.bashrc
+        line: 'export PATH=$PATH:/usr/bin:/usr/sbin'
+        create: yes
+
+# Configure Slurm Controller
+- name: Configure Slurm Controller
+  hosts: slurm_controller
+  become: yes
+  vars_files:
+    - group_vars/all.yml
+  tasks:
+    - name: Start MariaDB
+      systemd:
+        name: mariadb
+        state: started
+        enabled: yes
+
+    - name: Install PyMySQL
+      shell: python3 -c "import pymysql" 2>/dev/null || pip3 install pymysql || true
+      ignore_errors: yes
+
+    - name: Create Slurm database
+      community.mysql.mysql_db:
+        name: slurm_acct_db
+        state: present
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+      ignore_errors: yes
+
+    - name: Create Slurm database user
+      community.mysql.mysql_user:
+        name: "{{ slurm_db_user }}"
+        password: "{{ slurm_db_pass }}"
+        priv: 'slurm_acct_db.*:ALL'
+        host: localhost
+        state: present
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+      ignore_errors: yes
+
+    - name: Deploy slurmdbd.conf
+      template:
+        src: templates/slurmdbd.conf.j2
+        dest: /etc/slurm/slurmdbd.conf
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Deploy slurm.conf
+      template:
+        src: templates/slurm.conf.j2
+        dest: /etc/slurm/slurm.conf
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Update /etc/hosts on controller
+      blockinfile:
+        path: /etc/hosts
+        block: |
+          {{ hostvars['controller']['ansible_host'] }} controller
+          {% for i in range(1, (num_compute_nodes | int) + 1) %}
+          {{ hostvars['compute' + (i|string)]['ansible_host'] }} compute{{ i }}
+          {% endfor %}
+        marker: "# {mark} SLURM CLUSTER HOSTS"
+
+    - name: Create slurmdbd service
+      copy:
+        dest: /etc/systemd/system/slurmdbd.service
+        content: |
+          [Unit]
+          Description=Slurm DBD accounting daemon
+          After=network.target munge.service mariadb.service
+          ConditionPathExists=/etc/slurm/slurmdbd.conf
+
+          [Service]
+          Type=forking
+          EnvironmentFile=-/etc/default/slurmdbd
+          ExecStart=/usr/sbin/slurmdbd
+          ExecReload=/bin/kill -HUP $MAINPID
+          PIDFile=/var/run/slurmdbd.pid
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Create slurmctld service
+      copy:
+        dest: /etc/systemd/system/slurmctld.service
+        content: |
+          [Unit]
+          Description=Slurm controller daemon
+          After=network.target munge.service slurmdbd.service
+          ConditionPathExists=/etc/slurm/slurm.conf
+
+          [Service]
+          Type=forking
+          EnvironmentFile=-/etc/default/slurmctld
+          ExecStart=/usr/sbin/slurmctld
+          ExecReload=/bin/kill -HUP $MAINPID
+          PIDFile=/var/run/slurmctld.pid
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Start slurmdbd
+      systemd:
+        name: slurmdbd
+        state: restarted
+        enabled: yes
+
+    - name: Wait for slurmdbd
+      pause:
+        seconds: 10
+
+    - name: Start slurmctld
+      systemd:
+        name: slurmctld
+        state: restarted
+        enabled: yes
+
+    - name: Wait for slurmctld
+      pause:
+        seconds: 5
+
+# Configure Compute Nodes
+- name: Configure Compute Nodes
+  hosts: slurm_compute
+  become: yes
+  tasks:
+    - name: Fetch slurm.conf from controller
+      slurp:
+        src: /etc/slurm/slurm.conf
+      register: slurm_conf
+      delegate_to: "{{ groups['slurm_controller'][0] }}"
+
+    - name: Write slurm.conf to compute
+      copy:
+        content: "{{ slurm_conf.content | b64decode }}"
+        dest: /etc/slurm/slurm.conf
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Update /etc/hosts on compute nodes
+      blockinfile:
+        path: /etc/hosts
+        block: |
+          {{ hostvars['controller']['ansible_host'] }} controller
+          {% for i in range(1, (num_compute_nodes | int) + 1) %}
+          {{ hostvars['compute' + (i|string)]['ansible_host'] }} compute{{ i }}
+          {% endfor %}
+        marker: "# {mark} SLURM CLUSTER HOSTS"
+
+    - name: Set hostname on compute nodes
+      hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Create slurmd service
+      copy:
+        dest: /etc/systemd/system/slurmd.service
+        content: |
+          [Unit]
+          Description=Slurm node daemon
+          After=network.target munge.service
+          ConditionPathExists=/etc/slurm/slurm.conf
+
+          [Service]
+          Type=forking
+          EnvironmentFile=-/etc/default/slurmd
+          ExecStart=/usr/sbin/slurmd
+          ExecReload=/bin/kill -HUP $MAINPID
+          PIDFile=/var/run/slurmd.pid
+          KillMode=process
+          LimitNOFILE=131072
+          LimitMEMLOCK=infinity
+          LimitSTACK=infinity
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Start slurmd
+      systemd:
+        name: slurmd
+        state: restarted
+        enabled: yes
+
+# Configure Login Node as Slurm Client
+- name: Configure Login Node as Slurm Client
+  hosts: slurm_login
+  become: yes
+  tasks:
+    - name: Fetch slurm.conf from controller
+      slurp:
+        src: /etc/slurm/slurm.conf
+      register: slurm_conf
+      delegate_to: "{{ groups['slurm_controller'][0] }}"
+
+    - name: Write slurm.conf to login
+      copy:
+        content: "{{ slurm_conf.content | b64decode }}"
+        dest: /etc/slurm/slurm.conf
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Update /etc/hosts on login node
+      blockinfile:
+        path: /etc/hosts
+        block: |
+          {{ hostvars['controller']['ansible_host'] }} controller
+          {% for i in range(1, (num_compute_nodes | int) + 1) %}
+          {{ hostvars['compute' + (i|string)]['ansible_host'] }} compute{{ i }}
+          {% endfor %}
+        marker: "# {mark} SLURM CLUSTER HOSTS"
+
+# Verify Installation
+- name: Verify and Test Cluster
+  hosts: slurm_controller
+  become: yes
+  tasks:
+    - name: Wait for all services to stabilize
+      pause:
+        seconds: 10
+
+    - name: Check cluster status with sinfo
+      command: sinfo
+      register: sinfo_output
+      environment:
+        PATH: "/usr/bin:/usr/sbin:{{ ansible_env.PATH }}"
+
+    - name: Display cluster status
+      debug:
+        msg: "{{ sinfo_output.stdout_lines }}"
+
+    - name: Run test job
+      shell: srun -N1 hostname
+      register: test_job
+      environment:
+        PATH: "/usr/bin:/usr/sbin:{{ ansible_env.PATH }}"
+
+    - name: Display test result
+      debug:
+        msg: "{{ test_job.stdout }}"
+
+    - name: Final success message
+      debug:
+        msg:
+          - "=========================================="
+          - "✓✓✓ SLURM CLUSTER DEPLOYMENT COMPLETE ✓✓✓"
+          - "=========================================="
+          - ""
+          - "Cluster is fully operational!"
+          - ""
+          - "Login Node: Users can run Slurm commands directly"
+          - "Controller: Managing cluster operations"
+          - "Compute Nodes: {{ num_compute_nodes | int }} node(s) ready for jobs"
+          - ""
+
+# Test from Login Node
+- name: Test Slurm from Login Node
+  hosts: slurm_login
+  become: yes
+  tasks:
+    - name: Test sinfo from login
+      command: sinfo
+      register: login_sinfo
+      environment:
+        PATH: "/usr/bin:/usr/sbin:{{ ansible_env.PATH }}"
+      become_user: ubuntu
+
+    - name: Display sinfo from login
+      debug:
+        msg: "{{ login_sinfo.stdout_lines }}"
+
+    - name: Login node ready message
+      debug:
+        msg:
+          - "=========================================="
+          - "✓ Login Node is configured as Slurm Client"
+          - "=========================================="
+          - "Users can now SSH and run Slurm commands!"
