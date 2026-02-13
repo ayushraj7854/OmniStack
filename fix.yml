@@ -1,0 +1,656 @@
+---
+# =============================================================================
+# SLURM CLUSTER FIX - Addresses MySQL Plugin and Authentication Issues
+# =============================================================================
+
+- name: Fix SLURM Controller Configuration
+  hosts: slurm_controller
+  become: yes
+  gather_facts: yes
+  
+  tasks:
+    - name: Display fixing controller
+      debug:
+        msg: 
+          - "=========================================="
+          - "FIXING SLURM CONTROLLER"
+          - "=========================================="
+
+    - name: Get all compute nodes dynamically
+      set_fact:
+        all_compute_nodes: "{{ groups['slurm_compute'] }}"
+        num_nodes: "{{ groups['slurm_compute'] | length }}"
+
+    - name: Show detected compute nodes
+      debug:
+        msg: 
+          - "Detected {{ num_nodes }} compute nodes:"
+          - "{{ all_compute_nodes }}"
+
+    - name: Stop all SLURM services
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - slurmctld
+        - slurmdbd
+      ignore_errors: yes
+
+    - name: Kill any stuck SLURM processes
+      shell: |
+        pkill -9 slurmd || true
+        pkill -9 slurmctld || true
+        pkill -9 slurmdbd || true
+      changed_when: false
+
+    - name: Set hostname to controller
+      hostname:
+        name: controller
+
+    - name: Update /etc/hostname
+      copy:
+        content: "controller\n"
+        dest: /etc/hostname
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Build /etc/hosts entries dynamically
+      set_fact:
+        hosts_entries: |
+          {{ hostvars['controller']['ansible_host'] }} controller
+          {% for node in groups['slurm_compute'] %}
+          {{ hostvars[node]['ansible_host'] }} {{ node }}
+          {% endfor %}
+
+    - name: Update /etc/hosts with all nodes
+      blockinfile:
+        path: /etc/hosts
+        block: "{{ hosts_entries }}"
+        marker: "# {mark} SLURM CLUSTER HOSTS"
+        create: yes
+
+    - name: Create SLURM directories with proper permissions
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - /etc/slurm
+        - /var/spool/slurm
+        - /var/spool/slurm/d
+        - /var/spool/slurmctld
+        - /var/log/slurm
+
+    - name: Create PID directory
+      file:
+        path: /run
+        state: directory
+        mode: '0755'
+
+    - name: Remove old state files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/spool/slurmctld/job_state
+        - /var/spool/slurmctld/node_state
+        - /var/spool/slurmctld/partition_state
+      ignore_errors: yes
+
+    - name: Create log files
+      file:
+        path: "{{ item }}"
+        state: touch
+        owner: root
+        group: root
+        mode: '0644'
+      loop:
+        - /var/log/slurm/slurmctld.log
+        - /var/log/slurm/slurmd.log
+
+    - name: Check if slurm-mysql plugin is installed
+      shell: dpkg -l | grep slurm | grep mysql
+      register: mysql_plugin_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Display MySQL plugin status
+      debug:
+        msg: "SLURM MySQL plugin: {{ 'INSTALLED' if mysql_plugin_check.rc == 0 else 'NOT INSTALLED - Will disable accounting' }}"
+
+    - name: Build NodeName entries dynamically
+      set_fact:
+        node_definitions: |
+          {% for node in groups['slurm_compute'] %}
+          NodeName={{ node }} NodeAddr={{ hostvars[node]['ansible_host'] }} CPUs=1 State=UNKNOWN
+          {% endfor %}
+
+    - name: Build partition node list dynamically
+      set_fact:
+        partition_nodes: "compute[1-{{ groups['slurm_compute'] | length }}]"
+
+    - name: Deploy slurm.conf WITHOUT accounting (plugin not available)
+      copy:
+        content: |
+          ClusterName=cluster
+          SlurmctldHost=controller
+          
+          # Authentication
+          AuthType=auth/munge
+          CryptoType=crypto/munge
+          SlurmUser=root
+          
+          # Network Ports
+          SlurmctldPort=6817
+          SlurmdPort=6818
+          
+          # Directories
+          StateSaveLocation=/var/spool/slurmctld
+          SlurmdSpoolDir=/var/spool/slurm/d
+          SlurmctldLogFile=/var/log/slurm/slurmctld.log
+          SlurmdLogFile=/var/log/slurm/slurmd.log
+          
+          # PID Files
+          SlurmctldPidFile=/run/slurmctld.pid
+          SlurmdPidFile=/run/slurmd.pid
+          
+          # Accounting - DISABLED (MySQL plugin not available)
+          AccountingStorageType=accounting_storage/none
+          JobCompType=jobcomp/none
+          JobAcctGatherType=jobacct_gather/none
+          JobAcctGatherFrequency=30
+          
+          # Resource Selection
+          SelectType=select/cons_tres
+          SelectTypeParameters=CR_Core
+          
+          # Process Tracking
+          ProctrackType=proctrack/linuxproc
+          TaskPlugin=task/none
+          
+          # Scheduling
+          SchedulerType=sched/backfill
+          ReturnToService=1
+          
+          # Timeouts
+          InactiveLimit=0
+          KillWait=30
+          MinJobAge=300
+          SlurmctldTimeout=120
+          SlurmdTimeout=300
+          Waittime=0
+          
+          # Debug Levels
+          SlurmctldDebug=info
+          SlurmdDebug=info
+          
+          # COMPUTE NODES (Dynamically generated)
+          {{ node_definitions }}
+          
+          # PARTITIONS
+          PartitionName=debug Nodes={{ partition_nodes }} Default=YES MaxTime=INFINITE State=UP
+        dest: /etc/slurm/slurm.conf
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Restart munge
+      systemd:
+        name: munge
+        state: restarted
+        enabled: yes
+
+    - name: Wait for munge
+      pause:
+        seconds: 5
+
+    - name: Test munge authentication
+      shell: munge -n | unmunge
+      register: munge_test
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Show munge test result
+      debug:
+        msg: "Munge authentication: {{ 'OK' if munge_test.rc == 0 else 'FAILED' }}"
+
+    - name: Start slurmctld
+      systemd:
+        name: slurmctld
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Wait for slurmctld
+      pause:
+        seconds: 10
+
+    - name: Check slurmctld status
+      command: systemctl status slurmctld --no-pager
+      register: slurmctld_status
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Show slurmctld status
+      debug:
+        msg: "slurmctld: {{ 'RUNNING' if 'active (running)' in slurmctld_status.stdout else 'CHECK LOGS' }}"
+
+    - name: Check slurmctld logs if failed
+      shell: tail -20 /var/log/slurm/slurmctld.log
+      register: slurmctld_logs
+      changed_when: false
+      ignore_errors: yes
+      when: "'active (running)' not in slurmctld_status.stdout"
+
+    - name: Show slurmctld recent logs
+      debug:
+        msg: "{{ slurmctld_logs.stdout_lines }}"
+      when: slurmctld_logs.stdout_lines is defined
+
+    - name: Check if controller is responding
+      command: scontrol ping
+      register: ping
+      ignore_errors: yes
+      changed_when: false
+      environment:
+        PATH: "/usr/sbin:/usr/local/sbin:/usr/bin:/usr/local/bin"
+
+    - name: Show ping result
+      debug:
+        msg: "Controller ping: {{ 'SUCCESS' if ping.rc == 0 else 'FAILED' }}"
+
+    - name: Test sinfo
+      command: sinfo
+      register: sinfo
+      ignore_errors: yes
+      changed_when: false
+      environment:
+        PATH: "/usr/sbin:/usr/local/sbin:/usr/bin:/usr/local/bin"
+
+    - name: Show sinfo
+      debug:
+        msg: "{{ sinfo.stdout_lines if sinfo.rc == 0 else sinfo.stderr_lines }}"
+
+    - name: Controller success message
+      debug:
+        msg:
+          - "=========================================="
+          - "✓✓✓ CONTROLLER IS READY ✓✓✓"
+          - "=========================================="
+          - "NOTE: Job accounting is DISABLED (MySQL plugin not available)"
+          - "To enable accounting, install: slurm-wlm-mysql-plugin"
+      when: "'active (running)' in slurmctld_status.stdout"
+
+# =============================================================================
+# COMPUTE NODES CONFIGURATION
+# =============================================================================
+
+- name: Fix SLURM Compute Nodes
+  hosts: slurm_compute
+  become: yes
+  gather_facts: yes
+  
+  tasks:
+    - name: Display fixing compute nodes
+      debug:
+        msg: "========================================== FIXING {{ inventory_hostname }} =========================================="
+
+    - name: Stop slurmd service
+      systemd:
+        name: slurmd
+        state: stopped
+      ignore_errors: yes
+
+    - name: Kill any stuck slurmd processes
+      shell: pkill -9 slurmd || true
+      changed_when: false
+
+    - name: Set proper hostname
+      hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Update /etc/hostname
+      copy:
+        content: "{{ inventory_hostname }}\n"
+        dest: /etc/hostname
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Build /etc/hosts entries dynamically
+      set_fact:
+        hosts_entries: |
+          {{ hostvars['controller']['ansible_host'] }} controller
+          {% for node in groups['slurm_compute'] %}
+          {{ hostvars[node]['ansible_host'] }} {{ node }}
+          {% endfor %}
+
+    - name: Update /etc/hosts with all nodes
+      blockinfile:
+        path: /etc/hosts
+        block: "{{ hosts_entries }}"
+        marker: "# {mark} SLURM CLUSTER HOSTS"
+        create: yes
+
+    - name: Create SLURM directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - /etc/slurm
+        - /var/spool/slurm
+        - /var/spool/slurm/d
+        - /var/log/slurm
+
+    - name: Remove old slurmd state
+      file:
+        path: /var/spool/slurm/d/slurmd_state
+        state: absent
+      ignore_errors: yes
+
+    - name: Build NodeName entries dynamically
+      set_fact:
+        node_definitions: |
+          {% for node in groups['slurm_compute'] %}
+          NodeName={{ node }} NodeAddr={{ hostvars[node]['ansible_host'] }} CPUs=1 State=UNKNOWN
+          {% endfor %}
+
+    - name: Build partition node list dynamically
+      set_fact:
+        partition_nodes: "compute[1-{{ groups['slurm_compute'] | length }}]"
+
+    - name: Deploy slurm.conf on compute node
+      copy:
+        content: |
+          ClusterName=cluster
+          SlurmctldHost=controller
+          
+          # Authentication
+          AuthType=auth/munge
+          CryptoType=crypto/munge
+          SlurmUser=root
+          
+          # Network Ports
+          SlurmctldPort=6817
+          SlurmdPort=6818
+          
+          # Directories
+          StateSaveLocation=/var/spool/slurmctld
+          SlurmdSpoolDir=/var/spool/slurm/d
+          SlurmctldLogFile=/var/log/slurm/slurmctld.log
+          SlurmdLogFile=/var/log/slurm/slurmd.log
+          
+          # PID Files
+          SlurmctldPidFile=/run/slurmctld.pid
+          SlurmdPidFile=/run/slurmd.pid
+          
+          # Accounting - DISABLED
+          AccountingStorageType=accounting_storage/none
+          JobCompType=jobcomp/none
+          
+          # Resource Selection
+          SelectType=select/cons_tres
+          SelectTypeParameters=CR_Core
+          
+          # Process Tracking
+          ProctrackType=proctrack/linuxproc
+          TaskPlugin=task/none
+          
+          # Debug Levels
+          SlurmctldDebug=info
+          SlurmdDebug=info
+          
+          # COMPUTE NODES (Dynamically generated)
+          {{ node_definitions }}
+          
+          # PARTITIONS
+          PartitionName=debug Nodes={{ partition_nodes }} Default=YES MaxTime=INFINITE State=UP
+        dest: /etc/slurm/slurm.conf
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Restart munge on compute node
+      systemd:
+        name: munge
+        state: restarted
+        enabled: yes
+
+    - name: Wait for munge
+      pause:
+        seconds: 3
+
+    - name: Test munge on compute node
+      shell: munge -n | unmunge
+      register: munge_test
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Show munge test
+      debug:
+        msg: "Munge authentication: {{ 'OK' if munge_test.rc == 0 else 'FAILED' }}"
+
+    - name: Start slurmd
+      systemd:
+        name: slurmd
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Wait for slurmd
+      pause:
+        seconds: 5
+
+    - name: Check slurmd status
+      command: systemctl status slurmd --no-pager
+      register: slurmd_status
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Show slurmd status summary
+      debug:
+        msg: "{{ inventory_hostname }}: {{ 'RUNNING' if 'active (running)' in slurmd_status.stdout else 'FAILED' }}"
+
+    - name: Success message for node
+      debug:
+        msg: "✓✓✓ {{ inventory_hostname }} IS READY ✓✓✓"
+      when: "'active (running)' in slurmd_status.stdout"
+
+# =============================================================================
+# LOGIN NODE CONFIGURATION
+# =============================================================================
+
+- name: Update Login Node Configuration
+  hosts: slurm_login
+  become: yes
+  gather_facts: yes
+  
+  tasks:
+    - name: Display fixing login node
+      debug:
+        msg: "========================================== UPDATING LOGIN NODE =========================================="
+
+    - name: Build /etc/hosts entries dynamically
+      set_fact:
+        hosts_entries: |
+          {{ hostvars['controller']['ansible_host'] }} controller
+          {% for node in groups['slurm_compute'] %}
+          {{ hostvars[node]['ansible_host'] }} {{ node }}
+          {% endfor %}
+
+    - name: Update /etc/hosts with all nodes
+      blockinfile:
+        path: /etc/hosts
+        block: "{{ hosts_entries }}"
+        marker: "# {mark} SLURM CLUSTER HOSTS"
+        create: yes
+
+    - name: Ensure SLURM config directory exists
+      file:
+        path: /etc/slurm
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Build NodeName entries dynamically
+      set_fact:
+        node_definitions: |
+          {% for node in groups['slurm_compute'] %}
+          NodeName={{ node }} NodeAddr={{ hostvars[node]['ansible_host'] }} CPUs=1 State=UNKNOWN
+          {% endfor %}
+
+    - name: Build partition node list dynamically
+      set_fact:
+        partition_nodes: "compute[1-{{ groups['slurm_compute'] | length }}]"
+
+    - name: Deploy slurm.conf on login node
+      copy:
+        content: |
+          ClusterName=cluster
+          SlurmctldHost=controller
+          
+          # Authentication
+          AuthType=auth/munge
+          CryptoType=crypto/munge
+          SlurmUser=root
+          
+          # Network Ports
+          SlurmctldPort=6817
+          SlurmdPort=6818
+          
+          # Directories
+          StateSaveLocation=/var/spool/slurmctld
+          SlurmdSpoolDir=/var/spool/slurm/d
+          SlurmctldLogFile=/var/log/slurm/slurmctld.log
+          SlurmdLogFile=/var/log/slurm/slurmd.log
+          
+          # PID Files
+          SlurmctldPidFile=/run/slurmctld.pid
+          SlurmdPidFile=/run/slurmd.pid
+          
+          # Accounting - DISABLED
+          AccountingStorageType=accounting_storage/none
+          JobCompType=jobcomp/none
+          
+          # Resource Selection
+          SelectType=select/cons_tres
+          SelectTypeParameters=CR_Core
+          
+          # Process Tracking
+          ProctrackType=proctrack/linuxproc
+          TaskPlugin=task/none
+          
+          # Debug Levels
+          SlurmctldDebug=info
+          SlurmdDebug=info
+          
+          # COMPUTE NODES (Dynamically generated)
+          {{ node_definitions }}
+          
+          # PARTITIONS
+          PartitionName=debug Nodes={{ partition_nodes }} Default=YES MaxTime=INFINITE State=UP
+        dest: /etc/slurm/slurm.conf
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Restart munge on login node
+      systemd:
+        name: munge
+        state: restarted
+      ignore_errors: yes
+
+    - name: Login node success message
+      debug:
+        msg: "✓✓✓ LOGIN NODE IS READY ✓✓✓"
+
+# =============================================================================
+# FINAL VERIFICATION
+# =============================================================================
+
+- name: Final Cluster Verification
+  hosts: slurm_controller
+  become: yes
+  gather_facts: yes
+  
+  tasks:
+    - name: Display verification phase
+      debug:
+        msg:
+          - "=========================================="
+          - "RUNNING FINAL VERIFICATION"
+          - "=========================================="
+
+    - name: Wait for all nodes to register
+      pause:
+        seconds: 15
+
+    - name: Check sinfo
+      shell: sinfo
+      register: sinfo_result
+      changed_when: false
+      ignore_errors: yes
+      environment:
+        PATH: "/usr/sbin:/usr/local/sbin:/usr/bin:/usr/local/bin"
+
+    - name: Display cluster status
+      debug:
+        msg: "{{ sinfo_result.stdout_lines }}"
+
+    - name: Check node details
+      shell: scontrol show nodes | head -50
+      register: nodes_detail
+      changed_when: false
+      ignore_errors: yes
+      environment:
+        PATH: "/usr/sbin:/usr/local/sbin:/usr/bin:/usr/local/bin"
+
+    - name: Display node summary
+      debug:
+        msg: "{{ nodes_detail.stdout_lines }}"
+
+    - name: Run test job
+      shell: srun -N1 hostname
+      register: test_job
+      changed_when: false
+      ignore_errors: yes
+      environment:
+        PATH: "/usr/sbin:/usr/local/sbin:/usr/bin:/usr/local/bin"
+
+    - name: Display test job result
+      debug:
+        msg: "Test job executed on: {{ test_job.stdout }}"
+      when: test_job.rc == 0
+
+    - name: Final success message
+      debug:
+        msg:
+          - "=========================================="
+          - "✓✓✓ CLUSTER FIX COMPLETE! ✓✓✓"
+          - "=========================================="
+          - "Total compute nodes: {{ groups['slurm_compute'] | length }}"
+          - "Cluster status: OPERATIONAL"
+          - ""
+          - "✅ Controller: RUNNING"
+          - "✅ All {{ groups['slurm_compute'] | length }} compute nodes: CONFIGURED"
+          - "✅ Login node: CONFIGURED"
+          - ""
+          - "⚠️  NOTE: Job accounting is DISABLED"
+          - "    The slurm-wlm-mysql-plugin package is not installed."
+          - "    To enable accounting, run on controller:"
+          - "      sudo apt-get install slurm-wlm-mysql-plugin"
+          - "      Then reconfigure slurmdbd and update slurm.conf"
+          - ""
+          - "To use your cluster:"
+          - "  ssh -i ~/.ssh/mykey.pem ubuntu@{{ hostvars['login']['ansible_host'] }}"
+          - "  sinfo                    # View cluster"
+          - "  srun -N{{ groups['slurm_compute'] | length }} hostname    # Test all nodes"
+          - ""
+          - "🎉 CLUSTER IS READY!"
