@@ -1,0 +1,14 @@
+---
+# Slurm Source Settings
+slurm_version: "21.08.8"
+slurm_url: "https://download.schedmd.com/slurm/slurm-{{ slurm_version }}.tar.bz2"
+slurm_install_dir: "/root/slurm-{{ slurm_version }}"
+
+# Database Settings
+mysql_root_pass: "root"
+slurm_db_user: "root"
+slurm_db_pass: "root"
+
+# General Settings
+cluster_name: "cluster"
+partition_name: "partition"

@@ -1,0 +1,196 @@
+---
+- name: AWS VPC - Slurm Cluster with NAT Gateway
+  hosts: localhost
+  connection: local
+  gather_facts: no
+
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    region: ap-south-1
+
+    # Network
+    vpc_cidr: 10.0.0.0/16
+    public_subnet_cidr: 10.0.1.0/24
+    private_subnet_cidr: 10.0.2.0/24
+
+    # EC2
+    key_name: mykey
+    instance_type: t3.micro
+    ami_id: ami-03f4878755434977f   # Ubuntu 22.04 LTS (Mumbai)
+
+  tasks:
+
+  # ---------------- VPC / Subnets / IGW ---------------- #
+  - name: Create VPC
+    amazon.aws.ec2_vpc_net:
+      name: ansible-vpc
+      cidr_block: "{{ vpc_cidr }}"
+      region: "{{ region }}"
+      state: present
+    register: vpc
+
+  - name: Create Public Subnet
+    amazon.aws.ec2_vpc_subnet:
+      vpc_id: "{{ vpc.vpc.id }}"
+      cidr: "{{ public_subnet_cidr }}"
+      region: "{{ region }}"
+      map_public: true
+      state: present
+      tags:
+        Name: public-subnet
+    register: public_subnet_result
+
+  - name: Create Private Subnet
+    amazon.aws.ec2_vpc_subnet:
+      vpc_id: "{{ vpc.vpc.id }}"
+      cidr: "{{ private_subnet_cidr }}"
+      region: "{{ region }}"
+      state: present
+      tags:
+        Name: private-subnet
+    register: private_subnet_result
+
+  - name: Create Internet Gateway
+    amazon.aws.ec2_vpc_igw:
+      vpc_id: "{{ vpc.vpc.id }}"
+      region: "{{ region }}"
+      state: present
+    register: igw
+
+  # ---------------- NAT Gateway ---------------- #
+  - name: Allocate Elastic IP for NAT Gateway
+    amazon.aws.ec2_eip:
+      region: "{{ region }}"
+      state: present
+      in_vpc: yes
+      tags:
+        Name: nat-gateway-eip
+    register: nat_eip
+
+  - name: Create NAT Gateway
+    amazon.aws.ec2_vpc_nat_gateway:
+      state: present
+      subnet_id: "{{ public_subnet_result.subnet.id }}"
+      allocation_id: "{{ nat_eip.allocation_id }}"
+      region: "{{ region }}"
+      wait: yes
+      tags:
+        Name: slurm-nat-gateway
+    register: nat_gateway
+
+  # ---------------- Route Tables ---------------- #
+  - name: Create Public Route Table
+    amazon.aws.ec2_vpc_route_table:
+      vpc_id: "{{ vpc.vpc.id }}"
+      region: "{{ region }}"
+      subnets:
+        - "{{ public_subnet_result.subnet.id }}"
+      routes:
+        - dest: 0.0.0.0/0
+          gateway_id: "{{ igw.gateway_id }}"
+      tags:
+        Name: public-route-table
+      state: present
+
+  - name: Create Private Route Table (with NAT)
+    amazon.aws.ec2_vpc_route_table:
+      vpc_id: "{{ vpc.vpc.id }}"
+      region: "{{ region }}"
+      subnets:
+        - "{{ private_subnet_result.subnet.id }}"
+      routes:
+        - dest: 0.0.0.0/0
+          gateway_id: "{{ nat_gateway.nat_gateway_id }}"
+      tags:
+        Name: private-route-table
+      state: present
+
+  # ---------------- Security Groups ---------------- #
+  - name: Create Security Group for Login Node
+    amazon.aws.ec2_group:
+      name: login-sg
+      description: SSH from Internet
+      vpc_id: "{{ vpc.vpc.id }}"
+      region: "{{ region }}"
+      rules:
+        - proto: tcp
+          ports: 22
+          cidr_ip: 0.0.0.0/0
+          rule_desc: "SSH from anywhere"
+      state: present
+    register: login_sg
+
+  - name: Create Security Group for Private Nodes
+    amazon.aws.ec2_group:
+      name: private-sg
+      description: All internal traffic + SSH from login
+      vpc_id: "{{ vpc.vpc.id }}"
+      region: "{{ region }}"
+      rules:
+        - proto: tcp
+          ports: 22
+          group_id: "{{ login_sg.group_id }}"
+          rule_desc: "SSH from login node"
+        - proto: -1
+          from_port: -1
+          to_port: -1
+          cidr_ip: "{{ vpc_cidr }}"
+          rule_desc: "All traffic within VPC"
+      state: present
+    register: private_sg
+
+  # ---------------- Launch EC2 Instances ---------------- #
+  - name: Launch Login Node (Public Subnet)
+    amazon.aws.ec2_instance:
+      state: present
+      name: login
+      image_id: "{{ ami_id }}"
+      instance_type: "{{ instance_type }}"
+      key_name: "{{ key_name }}"
+      region: "{{ region }}"
+      wait: yes
+      vpc_subnet_id: "{{ public_subnet_result.subnet.id }}"
+      security_groups:
+        - "{{ login_sg.group_id }}"
+      network:
+        assign_public_ip: yes
+      tags:
+        Role: login
+        Name: login
+
+  - name: Launch Controller Node (Private Subnet)
+    amazon.aws.ec2_instance:
+      state: present
+      name: controller
+      image_id: "{{ ami_id }}"
+      instance_type: "{{ instance_type }}"
+      key_name: "{{ key_name }}"
+      region: "{{ region }}"
+      wait: yes
+      vpc_subnet_id: "{{ private_subnet_result.subnet.id }}"
+      security_groups:
+        - "{{ private_sg.group_id }}"
+      network:
+        assign_public_ip: no
+      tags:
+        Role: controller
+        Name: controller
+
+  - name: Launch Compute Nodes (Private Subnet)
+    amazon.aws.ec2_instance:
+      state: present
+      name: "compute{{ item }}"
+      image_id: "{{ ami_id }}"
+      instance_type: "{{ instance_type }}"
+      key_name: "{{ key_name }}"
+      region: "{{ region }}"
+      wait: yes
+      vpc_subnet_id: "{{ private_subnet_result.subnet.id }}"
+      security_groups:
+        - "{{ private_sg.group_id }}"
+      network:
+        assign_public_ip: no
+      tags:
+        Role: compute
+        Name: "compute{{ item }}"
+    loop: "{{ range(1, (num_compute_nodes | int) + 1) | list }}"
