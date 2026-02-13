@@ -7,7 +7,13 @@
 
 > **Fully automated deployment of a production-grade High Performance Computing (HPC) cluster on AWS using Ansible, complete with real-time monitoring via Prometheus and Grafana.**
 
-This project provides a complete Infrastructure-as-Code (IaC) solution for deploying a Slurm-based HPC cluster following real-world cloud HPC architecture patterns. Perfect for learning, research, and production workloads.
+This project demonstrates deployment of a production-style HPC cluster on AWS.
+
+I implemented the infrastructure provisioning, Slurm scheduling setup,
+node communication, and monitoring validation using Prometheus and Grafana.
+
+The cluster was tested by submitting batch jobs and monitoring node metrics.
+
 
 ---
 
